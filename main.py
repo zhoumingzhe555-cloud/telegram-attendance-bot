@@ -9,7 +9,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 # ==================== ⚙️ 机器人核心配置 ====================
 # ⚠️ 请把这里换成你自己的 Bot Token
 # 建议不要把 Token 发给别人；如果已经泄露，请去 BotFather 重置
-TOKEN = "8689239862:AAEsWUxI20GDFA82RxDrkVxC5naiIVrixps"
+TOKEN = os.getenv("TOKEN")
 
 # ==================== 📁 文件路径配置 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -534,9 +534,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== 🚀 主程序 ====================
 def main():
-    if TOKEN == "请在这里填写你的Telegram_Bot_Token":
-        print("❌ 请先在代码顶部填写你的 Telegram Bot Token")
+    if not TOKEN:
+        print("❌ 没有读取到 Railway 的 TOKEN 环境变量")
         return
+
+    print("✅ 已读取到 Railway TOKEN")
 
     application = Application.builder().token(TOKEN).build()
 
