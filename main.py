@@ -26,7 +26,7 @@ WORK_START_TIME = time(9, 55, 0)
 WORK_END_TIME = time(2, 0, 0)
 
 # 自动发送下班统计时间：02:00:05
-DAILY_REPORT_TIME = time(2, 0, 5, tzinfo=TZ_CHINA)
+DAILY_REPORT_TIME = time(3, 0, 5, tzinfo=TZ_CHINA)
 
 # 自动清空 CSV 时间：03:05
 AUTO_RESET_TIME = time(3, 5, 0, tzinfo=TZ_CHINA)
