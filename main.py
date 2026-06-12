@@ -29,7 +29,7 @@ WORK_END_TIME = time(2, 0, 0)
 DAILY_REPORT_TIME = time(3, 0, 5, tzinfo=TZ_CHINA)
 
 # 自动清空 CSV 时间：03:05
-AUTO_RESET_TIME = time(3, 5, 0, tzinfo=TZ_CHINA)
+AUTO_RESET_TIME = time(5, 5, 0, tzinfo=TZ_CHINA)
 
 # ==================== 🚨 超时限制配置 ====================
 TIMEOUT_LIMITS = {
