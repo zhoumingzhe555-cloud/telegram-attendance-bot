@@ -1,5 +1,6 @@
 import csv
 import os
+import json
 import threading
 from datetime import datetime, time, timedelta, timezone
 
@@ -14,6 +15,7 @@ TOKEN = os.getenv("TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "work_records.csv")
 CHAT_ID_FILE = os.path.join(BASE_DIR, "group_chat_id.txt")
+QUEUE_FILE = os.path.join(BASE_DIR, "ai_queue.json")
 
 # ==================== ⏰ 时间配置 ====================
 TZ_CHINA = timezone(timedelta(hours=8))
@@ -45,7 +47,7 @@ VALID_ITEMS = {
     "吃饭": "🍱 离开去吃饭/就餐",
     "语音": "🎙️ 离开去发语音/听语音",
     "抽烟": "🚬 离开去抽烟",
-    "AI": "🤖 查询AI室空位",
+    "AI": "🤖 申请AI室",
     "1号AI室": "🤖 进入 1号AI室 使用人工智能",
     "2号AI室": "🤖 进入 2号AI室 使用人工智能",
     "3号AI室": "🤖 进入 3号AI室 使用人工智能",
@@ -67,9 +69,11 @@ TRADITIONAL_MAP = {
 }
 
 csv_lock = threading.Lock()
+queue_lock = threading.Lock()
 CURRENT_CHAT_ID = None
 
 
+# ==================== 📌 基础工具函数 ====================
 def init_csv_file():
     try:
         with open(CSV_FILE, mode="w", newline="", encoding="utf-8-sig") as f:
@@ -89,7 +93,6 @@ def ensure_csv_exists():
 
 def load_chat_id():
     global CURRENT_CHAT_ID
-
     if CURRENT_CHAT_ID:
         return CURRENT_CHAT_ID
 
@@ -102,14 +105,12 @@ def load_chat_id():
                     return CURRENT_CHAT_ID
         except Exception as e:
             print(f"❌ 读取群 chat_id 失败: {e}")
-
     return None
 
 
 def save_chat_id(chat_id):
     global CURRENT_CHAT_ID
     CURRENT_CHAT_ID = chat_id
-
     try:
         with open(CHAT_ID_FILE, "w", encoding="utf-8") as f:
             f.write(str(chat_id))
@@ -119,6 +120,7 @@ def save_chat_id(chat_id):
 
 
 def get_business_date(dt):
+    # 凌晨 03:00 前算前一天班次
     if dt.time() < time(3, 0, 0):
         return (dt - timedelta(days=1)).strftime("%Y-%m-%d")
     return dt.strftime("%Y-%m-%d")
@@ -126,17 +128,24 @@ def get_business_date(dt):
 
 def normalize_text(raw_text):
     text = raw_text.strip()
-
     for trad, simp in TRADITIONAL_MAP.items():
         if trad in text:
             text = text.replace(trad, simp)
 
-    low = text.lower()
-    if low == "ai" or low.startswith("ai "):
-        return "AI"
-
     compact = text.replace(" ", "").replace("　", "")
     low_compact = compact.lower()
+
+    if low_compact in ["ai", "申请ai", "排ai", "我要ai"]:
+        return "AI"
+
+    if compact in ["AI室", "ai室", "Ai室", "aI室", "房间", "房間"]:
+        return "AI室"
+
+    if compact in ["排队", "排隊", "队列", "隊列", "AI排队", "ai排队"]:
+        return "排队"
+
+    if compact in ["取消排队", "取消排隊", "退出排队", "退出排隊", "不排了"]:
+        return "取消排队"
 
     if low_compact in ["1号ai室", "1号ai", "一号ai室", "一号ai"]:
         return "1号AI室"
@@ -148,10 +157,85 @@ def normalize_text(raw_text):
     return text
 
 
+def mention_user(user_id, name):
+    safe_name = name or "用户"
+    return f"<a href='tg://user?id={user_id}'>{safe_name}</a>"
+
+
 ensure_csv_exists()
 load_chat_id()
 
 
+# ==================== 🤖 AI排队文件 ====================
+def load_ai_queue():
+    with queue_lock:
+        if not os.path.exists(QUEUE_FILE):
+            return []
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+
+def save_ai_queue(queue):
+    with queue_lock:
+        try:
+            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+                json.dump(queue, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"❌ 保存AI队列失败: {e}")
+
+
+def add_to_ai_queue(user_id, name):
+    queue = load_ai_queue()
+    uid = str(user_id)
+
+    for index, item in enumerate(queue, start=1):
+        if str(item.get("uid")) == uid:
+            return False, index
+
+    queue.append({
+        "uid": uid,
+        "name": name,
+        "time": datetime.now(TZ_CHINA).strftime("%Y-%m-%d %H:%M:%S")
+    })
+    save_ai_queue(queue)
+    return True, len(queue)
+
+
+def remove_from_ai_queue(user_id):
+    queue = load_ai_queue()
+    uid = str(user_id)
+    new_queue = [item for item in queue if str(item.get("uid")) != uid]
+    changed = len(new_queue) != len(queue)
+    if changed:
+        save_ai_queue(new_queue)
+    return changed
+
+
+def pop_next_ai_queue():
+    queue = load_ai_queue()
+    if not queue:
+        return None
+    next_user = queue.pop(0)
+    save_ai_queue(queue)
+    return next_user
+
+
+def get_ai_queue_text():
+    queue = load_ai_queue()
+    if not queue:
+        return "📋 <b>AI排队名单</b>\n\n✅ 当前无人排队。"
+
+    text = "📋 <b>AI排队名单</b>\n\n"
+    for i, item in enumerate(queue, start=1):
+        text += f"{i}. {mention_user(item.get('uid'), item.get('name'))}\n"
+    return text
+
+
+# ==================== 📊 CSV读取/统计 ====================
 def get_today_action_count(user_id, action, biz_date_str):
     count = 0
     with csv_lock:
@@ -177,7 +261,6 @@ def get_last_leave_record(user_id):
         for row in reversed(rows):
             if not row or len(row) < 5:
                 continue
-
             if str(row[2]) != str(user_id):
                 continue
 
@@ -211,7 +294,6 @@ def get_active_ai_rooms():
                     for room, info in list(active_rooms.items()):
                         if info["uid"] == uid:
                             active_rooms.pop(room, None)
-
                     active_rooms[action] = {"uid": uid, "name": name}
 
                 elif action in ["回", "下班"]:
@@ -222,28 +304,27 @@ def get_active_ai_rooms():
     return active_rooms
 
 
-def get_ai_room_tip_text():
+def get_ai_room_status_text():
     active_rooms = get_active_ai_rooms()
+    lines = ["🤖 <b>AI室状态</b>\n"]
+
+    for room in AI_ROOMS:
+        if room in active_rooms:
+            info = active_rooms[room]
+            lines.append(f"{room}：🚫 {mention_user(info['uid'], info['name'])} 使用中")
+        else:
+            lines.append(f"{room}：✅ 空闲")
+
     free_rooms = [room for room in AI_ROOMS if room not in active_rooms]
-
-    if active_rooms:
-        used_text = "、".join([f"{room}（{info['name']}使用中）" for room, info in active_rooms.items()])
-    else:
-        used_text = "暂无占用"
-
     if free_rooms:
-        return (
-            f"🤖 <b>AI室使用提醒</b>\n\n"
-            f"🚫 已占用：{used_text}\n"
-            f"✅ 可使用：<b>{'、'.join(free_rooms)}</b>\n\n"
-            f"请发送具体房间，例如：<b>{free_rooms[0]}</b>"
-        )
+        lines.append(f"\n✅ 可用：<b>{'、'.join(free_rooms)}</b>")
+    else:
+        lines.append("\n❌ 当前三个AI室都已占用。")
 
-    return (
-        f"🤖 <b>AI室使用提醒</b>\n\n"
-        f"🚫 已占用：{used_text}\n"
-        f"❌ 当前 1号AI室、2号AI室、3号AI室 都已被占用，请稍后再使用。"
-    )
+    queue = load_ai_queue()
+    lines.append(f"📋 当前排队人数：<b>{len(queue)}</b>")
+
+    return "\n".join(lines)
 
 
 def generate_report_text():
@@ -255,7 +336,6 @@ def generate_report_text():
 
     with csv_lock:
         ensure_csv_exists()
-
         with open(CSV_FILE, mode="r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             next(reader, None)
@@ -325,18 +405,17 @@ def generate_report_text():
                 leave_details.append(f"{icon}{act_name} {act_info['count']}次")
 
         detail_text = "、".join(leave_details) if leave_details else "正常在岗，无离岗记录"
-
         report_text += f" └ 📝 出勤细节： {detail_text}\n──────────────────\n"
 
     return report_text
 
 
+# ==================== 🚨 超时提醒 ====================
 async def timeout_alert(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
     alert_text = (
         f"🚨 <b>【超时严重警告】</b> 🚨\n\n"
-        f"👤 <a href='tg://user?id={d['user_id']}'>{d['full_name']}</a> "
-        f"登记为 [<b>{d['action']}</b>]\n"
+        f"👤 {mention_user(d['user_id'], d['full_name'])} 登记为 [<b>{d['action']}</b>]\n"
         f"⚠️ 规定的 <b>{d['minutes']}</b> 分钟时限已过！\n\n"
         f"📢 <b>您已严重超时，请准备接受惩罚！</b> 💀"
     )
@@ -347,11 +426,30 @@ async def timeout_alert(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ 发送超时报警失败: {e}")
 
 
+async def notify_next_queue_user(context, chat_id, room):
+    next_user = pop_next_ai_queue()
+    if not next_user:
+        return
+
+    text = (
+        f"📢 <b>AI室排队叫号</b>\n\n"
+        f"<b>{room}</b> 已空出。\n"
+        f"请 {mention_user(next_user['uid'], next_user['name'])} 去 <b>{room}</b>。\n\n"
+        f"请发送：<b>{room}</b> 正式登记。"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        print(f"❌ 发送AI叫号失败: {e}")
+
+
+# ==================== ⏰ 自动任务 ====================
 async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = load_chat_id()
 
     if not chat_id:
-        print("❌ 没有找到群 chat_id，无法自动发送下班统计。请先在群里发送 /chatid")
+        print("❌ 没有找到群 chat_id，无法自动发送下班统计。请先在群里发送：chatid 或 /chatid")
         return
 
     try:
@@ -364,9 +462,11 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 async def auto_reset_csv_job(context: ContextTypes.DEFAULT_TYPE):
     with csv_lock:
         init_csv_file()
-        print("⏰ 新班次开始，CSV数据已安全重置。")
+        save_ai_queue([])
+        print("⏰ 新班次开始，CSV数据和AI队列已安全重置。")
 
 
+# ==================== 🧾 命令 / 文字兼容 ====================
 async def manual_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
@@ -390,11 +490,7 @@ async def test_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await daily_report_job(context)
 
 
-async def airooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(get_ai_room_tip_text(), parse_mode="HTML")
-
-
+# ==================== 💬 消息处理 ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_user:
         return
@@ -402,15 +498,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.message.chat_id
     raw_text = update.message.text.strip()
+    normalized_text = normalize_text(raw_text)
 
     print("收到消息:", raw_text)
 
-    normalized_text = normalize_text(raw_text)
+    # 保存群ID
+    if normalized_text in ["chatid", "群id", "保存群id"]:
+        save_chat_id(chat_id)
+        await update.message.reply_text(
+            f"✅ 当前群 chat_id 已保存：\n<code>{chat_id}</code>",
+            parse_mode="HTML"
+        )
+        return
 
-    # 用户只发 AI：不登记，只提醒空AI室
+    # 查看AI室
+    if normalized_text == "AI室":
+        save_chat_id(chat_id)
+        await update.message.reply_text(get_ai_room_status_text(), parse_mode="HTML")
+        return
+
+    # 查看排队
+    if normalized_text == "排队":
+        save_chat_id(chat_id)
+        await update.message.reply_text(get_ai_queue_text(), parse_mode="HTML")
+        return
+
+    # 取消排队
+    if normalized_text == "取消排队":
+        save_chat_id(chat_id)
+        removed = remove_from_ai_queue(user.id)
+        if removed:
+            await update.message.reply_text("✅ 已退出AI排队队列。")
+        else:
+            await update.message.reply_text("ℹ️ 你当前不在AI排队队列中。")
+        return
+
+    # 用户发 AI：有空房就提示；没空房就自动排队
     if normalized_text == "AI":
         save_chat_id(chat_id)
-        await update.message.reply_text(get_ai_room_tip_text(), parse_mode="HTML")
+        active_rooms = get_active_ai_rooms()
+        free_rooms = [room for room in AI_ROOMS if room not in active_rooms]
+
+        if free_rooms:
+            await update.message.reply_text(
+                f"🤖 <b>AI室申请</b>\n\n"
+                f"{get_ai_room_status_text()}\n\n"
+                f"请发送具体房间，例如：<b>{free_rooms[0]}</b>",
+                parse_mode="HTML"
+            )
+        else:
+            added, position = add_to_ai_queue(user.id, user.full_name)
+            if added:
+                await update.message.reply_text(
+                    f"🤖 当前三个AI室都已满。\n\n"
+                    f"✅ 已为你加入AI排队。\n"
+                    f"📌 当前排队第 <b>{position}</b> 位。\n\n"
+                    f"发送 <b>排队</b> 可查看队列。\n"
+                    f"发送 <b>取消排队</b> 可退出队列。",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"ℹ️ 你已经在AI排队队列中。\n"
+                    f"📌 当前排队第 <b>{position}</b> 位。",
+                    parse_mode="HTML"
+                )
         return
 
     user_text = None
@@ -438,12 +590,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
             else:
-                await update.message.reply_text(
-                    f"❌ <b>{user_text}</b> 已被 <b>{active_rooms[user_text]['name']}</b> 使用中。\n"
-                    f"当前三个AI室都已被占用，请稍后再使用。",
-                    parse_mode="HTML"
-                )
+                added, position = add_to_ai_queue(user.id, user.full_name)
+                if added:
+                    await update.message.reply_text(
+                        f"❌ <b>{user_text}</b> 已被 <b>{active_rooms[user_text]['name']}</b> 使用中。\n"
+                        f"当前三个AI室都已占用。\n\n"
+                        f"✅ 已为你加入AI排队，第 <b>{position}</b> 位。",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ <b>{user_text}</b> 已被 <b>{active_rooms[user_text]['name']}</b> 使用中。\n"
+                        f"你已在AI排队中。",
+                        parse_mode="HTML"
+                    )
             return
+
+        # 进入具体AI室后，如果他原本在队列里，则移除
+        remove_from_ai_queue(user.id)
 
     save_chat_id(chat_id)
 
@@ -461,6 +625,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if current_time < WORK_END_TIME and current_time > time(3, 0, 0):
             status_note = "⚠️ 早退"
 
+    # 记录回之前，先看看他是不是从哪个AI室释放出来
+    released_ai_room = None
+    if user_text in ["回", "下班"]:
+        active_before = get_active_ai_rooms()
+        for room, info in active_before.items():
+            if info["uid"] == str(user.id):
+                released_ai_room = room
+                break
+
+    # 取消当前用户之前的超时提醒
     job_id = f"timeout_{user.id}"
     for job in context.job_queue.get_jobs_by_name(job_id):
         job.schedule_removal()
@@ -548,13 +722,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_msg += duration_report
     else:
         reply_msg += f"🔢 <b>今日该项累计：</b> {past_count} 次\n"
-
         if status_note != "正常":
             reply_msg += f"📢 <b>考勤提醒：</b> {status_note}\n"
 
     await update.message.reply_text(reply_msg, parse_mode="HTML")
 
+    # 如果释放了AI室，自动叫下一个排队人
+    if released_ai_room:
+        await notify_next_queue_user(context, chat_id, released_ai_room)
 
+
+# ==================== 🚀 主程序 ====================
 def main():
     if not TOKEN:
         print("❌ 没有读取到 TOKEN 环境变量")
@@ -568,11 +746,11 @@ def main():
     application.add_handler(CommandHandler("report", manual_report_command))
     application.add_handler(CommandHandler("chatid", chatid_command))
     application.add_handler(CommandHandler("testreport", test_report_command))
-    application.add_handler(CommandHandler("airooms", airooms_command))
+
+    # 普通文字处理
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     job_queue = application.job_queue
-
     if job_queue is None:
         print('❌ JobQueue 未启用。请安装：pip install "python-telegram-bot[job-queue]"')
         return
@@ -583,9 +761,9 @@ def main():
     print("✅ 考勤机器人已启动")
     print(f"📊 自动下班统计时间：{DAILY_REPORT_TIME}")
     print(f"🧹 自动清空CSV时间：{AUTO_RESET_TIME}")
-    print("💡 群里发送 /chatid 保存群ID")
-    print("💡 群里发送 /testreport 测试自动报表")
-    print("💡 群里发送 /airooms 查看AI室占用情况")
+    print("💡 群里发送：AI / AI室 / 排队 / 取消排队")
+    print("💡 群里发送：/chatid 保存群ID")
+    print("💡 群里发送：/testreport 测试自动报表")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
