@@ -16,6 +16,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "work_records.csv")
 CHAT_ID_FILE = os.path.join(BASE_DIR, "group_chat_id.txt")
 QUEUE_FILE = os.path.join(BASE_DIR, "ai_queue.json")
+REPORT_FILE = os.path.join(BASE_DIR, "attendance_report.txt")
+MAX_MESSAGE_LEN = 3500
 
 # ==================== ⏰ 时间配置 ====================
 TZ_CHINA = timezone(timedelta(hours=8))
@@ -146,6 +148,9 @@ def normalize_text(raw_text):
 
     if compact in ["取消排队", "取消排隊", "退出排队", "退出排隊", "不排了"]:
         return "取消排队"
+
+    if compact in ["报表", "日报", "出勤表", "考勤表", "统计"]:
+        return "报表"
 
     if low_compact in ["1号ai室", "1号ai", "一号ai室", "一号ai"]:
         return "1号AI室"
@@ -410,6 +415,32 @@ def generate_report_text():
     return report_text
 
 
+async def send_long_report(bot, chat_id, report_text, title="出勤日报"):
+    """
+    修复 Telegram 的 Message is too long：
+    - 短报表：直接发群消息
+    - 长报表：自动生成 TXT 文件发到群里
+    """
+    try:
+        if len(report_text) <= MAX_MESSAGE_LEN:
+            await bot.send_message(chat_id=chat_id, text=report_text, parse_mode="HTML")
+            return
+
+        with open(REPORT_FILE, "w", encoding="utf-8-sig") as f:
+            f.write(report_text)
+
+        with open(REPORT_FILE, "rb") as f:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=f"{title}_{datetime.now(TZ_CHINA).strftime('%Y-%m-%d_%H-%M-%S')}.txt",
+                caption=f"📄 {title}内容较长，已自动生成TXT文件。"
+            )
+    except Exception as e:
+        print(f"❌ 发送报表失败: {e}")
+        raise
+
+
 # ==================== 🚨 超时提醒 ====================
 async def timeout_alert(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
@@ -453,7 +484,8 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await context.bot.send_message(chat_id=chat_id, text=generate_report_text(), parse_mode="HTML")
+        report = generate_report_text()
+        await send_long_report(context.bot, chat_id, report, title="全员出勤总榜单")
         print("✅ 下班统计报表已自动发送")
     except Exception as e:
         print(f"❌ 自动发送下班统计失败: {e}")
@@ -469,10 +501,9 @@ async def auto_reset_csv_job(context: ContextTypes.DEFAULT_TYPE):
 # ==================== 🧾 命令 / 文字兼容 ====================
 async def manual_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text(
-            generate_report_text() + "\n💡 <i>提示：此报表由管理员手动调用生成。</i>",
-            parse_mode="HTML"
-        )
+        save_chat_id(update.message.chat_id)
+        report = generate_report_text() + "\n💡 提示：此报表由管理员手动调用生成。"
+        await send_long_report(context.bot, update.message.chat_id, report, title="手动出勤报表")
 
 
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,7 +518,8 @@ async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def test_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         save_chat_id(update.message.chat_id)
-        await daily_report_job(context)
+        report = generate_report_text()
+        await send_long_report(context.bot, update.message.chat_id, report, title="测试出勤报表")
 
 
 # ==================== 💬 消息处理 ====================
@@ -509,6 +541,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ 当前群 chat_id 已保存：\n<code>{chat_id}</code>",
             parse_mode="HTML"
         )
+        return
+
+    # 查看出勤报表：普通文字触发，内容太长自动发TXT
+    if normalized_text == "报表":
+        save_chat_id(chat_id)
+        report = generate_report_text()
+        await send_long_report(context.bot, chat_id, report, title="出勤报表")
         return
 
     # 查看AI室
@@ -761,9 +800,10 @@ def main():
     print("✅ 考勤机器人已启动")
     print(f"📊 自动下班统计时间：{DAILY_REPORT_TIME}")
     print(f"🧹 自动清空CSV时间：{AUTO_RESET_TIME}")
-    print("💡 群里发送：AI / AI室 / 排队 / 取消排队")
+    print("💡 群里发送：AI / AI室 / 排队 / 取消排队 / 报表")
     print("💡 群里发送：/chatid 保存群ID")
     print("💡 群里发送：/testreport 测试自动报表")
+    print("💡 报表太长时会自动发送TXT文件")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
