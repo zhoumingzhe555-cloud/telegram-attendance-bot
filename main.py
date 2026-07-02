@@ -118,6 +118,14 @@ def group_count(cid, uid, actions, bdate):
     actions = set(actions)
     return sum(1 for r in read_rows(cid)[1:] if len(r)>=5 and r[1]==bdate and str(r[2])==str(uid) and r[4] in actions)
 
+def action_counts(cid, uid, actions, bdate):
+    result = {a: 0 for a in actions}
+    actions_set = set(actions)
+    for r in read_rows(cid)[1:]:
+        if len(r) >= 5 and r[1] == bdate and str(r[2]) == str(uid) and r[4] in actions_set:
+            result[r[4]] = result.get(r[4], 0) + 1
+    return result
+
 def load_queue(cid): return load_json(queue_file(cid), [])
 def save_queue(cid, q): save_json(queue_file(cid), q)
 
@@ -213,7 +221,7 @@ def config_text(cid,cfg):
     for name,data in cfg.get("group_count_limits",{}).items(): gl.append(f"{name}：{' + '.join(data['items'])} 合计 {data['limit']} 次")
     return f"⚙️ <b>本群配置</b>\n\n上班：{cfg['start']}\n下班：{cfg['end']}\n日报：{cfg['report']}\n清空：{cfg['reset']}\nAI室：{'、'.join(cfg['rooms'])}\n\n项目：{'、'.join(cfg['items'].keys())}\n\n超时限制：{cfg.get('timeout_limits',{})}\n单项次数限制：{cfg.get('count_limits',{})}\n合计次数限制：{('；'.join(gl) if gl else '无')}"
 
-def menu_text(): return "📋 <b>企业版 V5 菜单</b>\n\n普通文字：AI / AI室 / 排队 / 取消排队 / 报表 / 配置\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
+def menu_text(): return "📋 <b>企业版 V5.1 菜单</b>\n\n普通文字：AI / AI室 / 排队 / 取消排队 / 报表 / 配置\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
 
 async def timeout_alert(context):
     d=context.job.data
@@ -337,10 +345,17 @@ async def handle_message(update, context):
     if duration_msg: reply+=duration_msg
     if action in cfg.get("count_limits",{}) and past>int(cfg["count_limits"][action]): reply+=f"🚨 <b>次数警告：</b>{action} 今日第 <b>{past}</b> 次，超过规定 <b>{cfg['count_limits'][action]}</b> 次！\n"
     for lname,data in cfg.get("group_count_limits",{}).items():
-        if action in data.get("items",[]):
-            total=group_count(cid,user.id,data["items"],bdate)+1
-            reply+=f"📈 {lname}合计：<b>{total}/{data['limit']}</b> 次\n"
-            if total>int(data["limit"]): reply+=f"⚠️ <b>{lname}次数已超出每日上限！</b>\n"
+        limit_items = data.get("items", [])
+        if action in limit_items:
+            counts = action_counts(cid, user.id, limit_items, bdate)
+            total = sum(counts.values())
+            reply += f"\n📊 <b>{lname}统计：</b>\n"
+            for item in limit_items:
+                show_name = item.upper() if item.lower().startswith("wc") else item
+                reply += f"{show_name}：{counts.get(item, 0)}\n"
+            reply += f"\n📈 {lname}合计：<b>{total} / {data['limit']}</b> 次\n"
+            if total > int(data["limit"]):
+                reply += f"⚠️ <b>{lname}次数已超出每日上限！</b>\n"
     if status!="正常": reply+=f"📢 考勤提醒：{status}\n"
     await update.message.reply_text(reply,parse_mode="HTML")
     if released:
@@ -356,6 +371,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if app.job_queue is None: print('❌ JobQueue 未启用'); return
     app.job_queue.run_repeating(scheduler, interval=60, first=10, name="v5_scheduler")
-    print("✅ 企业版 V5 已启动：无代码配置 / 多群独立 / AI排队 / 合计限制 / TXT日报", flush=True)
+    print("✅ 企业版 V5.1 已启动：详细离岗统计 / 多群独立 / AI排队 / TXT日报", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__ == "__main__": main()
