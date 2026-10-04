@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import threading
+from io import BytesIO
 from datetime import datetime, time, timedelta, timezone
 
 from telegram import Update
@@ -57,7 +58,7 @@ def ensure_csv(cid):
     p = records_file(cid)
     if not os.path.exists(p):
         with open(p, "w", newline="", encoding="utf-8-sig") as f:
-            csv.writer(f).writerow(["时间","日期","用户ID","昵称","动作项目","当前项目累计次数","考勤状态","离开时长"])
+            csv.writer(f).writerow(["时间","日期","用户ID","昵称","动作项目","当前项目累计次数","考勤状态","离开时长","记录类型"])
 
 def get_cfg(cid):
     groups = load_json(GROUPS_FILE, {})
@@ -91,6 +92,7 @@ def normalize(raw, cfg):
     for a,b in TRAD_MAP.items(): text = text.replace(a,b)
     compact = text.replace(" ", "").replace("　", "")
     low = compact.lower()
+    if low in ["ai室记录", "ai室紀錄", "ai室記錄", "ai使用记录", "ai使用紀錄"]: return "AI室记录"
     if low in ["ai","申请ai","我要ai","排ai"]: return "AI"
     if compact in ["AI室","ai室","房间","房間"]: return "AI室"
     if compact in ["排队","排隊","队列","隊列","AI排队","ai排队"]: return "排队"
@@ -179,6 +181,83 @@ def last_leave(cid, uid, cfg):
         if r[4] in leave: return r[4],r[0]
     return None,None
 
+def ai_usage_sessions(cid, cfg, now=None):
+    """Reconstruct this reset cycle only; no separate history is stored."""
+    now = now or datetime.now(TZ_CHINA)
+    cutoff = datetime.combine(now.date(), parse_hm(cfg["reset"]), tzinfo=TZ_CHINA)
+    if now < cutoff:
+        cutoff -= timedelta(days=1)
+    sessions, active = [], {}
+    for row in read_rows(cid)[1:]:
+        if len(row) < 5:
+            continue
+        try:
+            at = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_CHINA)
+        except ValueError:
+            continue
+        if not cutoff <= at <= now:
+            continue
+        uid, name, action = str(row[2]), row[3], row[4]
+        # New rows keep a marker so renaming/deleting a room does not erase its usage.
+        is_room = action in cfg["rooms"] or (len(row) > 8 and row[8] == "AI室")
+        if is_room:
+            previous = active.get(uid)
+            if previous and previous["room"] == action:
+                continue  # Repeated check-in is still the same visit.
+            if previous:
+                previous["end"] = at
+                previous["reason"] = "换房"
+            session = {"uid": uid, "name": name, "room": action,
+                       "start": at, "end": None, "reason": "使用中"}
+            sessions.append(session)
+            active[uid] = session
+        elif action in ["回", "下班"]:
+            previous = active.pop(uid, None)
+            if previous:
+                previous["end"] = at
+                previous["reason"] = action
+    return cutoff, sessions
+
+
+def ai_usage_text(cid, cfg, now=None):
+    now = now or datetime.now(TZ_CHINA)
+    cutoff, sessions = ai_usage_sessions(cid, cfg, now)
+    lines = ["AI室使用记录（本轮）", f"所属群：{cid}",
+             f"统计范围：{cutoff:%Y-%m-%d %H:%M} 至 {now:%Y-%m-%d %H:%M}",
+             f"每天 {cfg['reset']} 随考勤清空，不保留历史。", ""]
+    if not sessions:
+        lines.append("暂无AI室使用记录。")
+    for number, session in enumerate(sessions, 1):
+        seconds = max(0, int(((session["end"] or now) - session["start"]).total_seconds()))
+        end = session["end"].strftime("%m-%d %H:%M:%S") if session["end"] else "使用中"
+        lines.extend([f"{number}. {session['name']}（ID：{session['uid']}）｜{session['room']}",
+                      f"进入：{session['start']:%m-%d %H:%M:%S}",
+                      f"离开：{end}",
+                      f"时长：{seconds // 60}分{seconds % 60}秒｜{session['reason']}", ""])
+    if sessions:
+        lines.append(f"共 {len(sessions)} 次使用，{sum(s['end'] is None for s in sessions)} 人使用中。")
+    return "\n".join(lines)
+
+
+async def send_ai_usage(bot, cid, chat_id, cfg):
+    text = ai_usage_text(cid, cfg)
+    if len(text.encode("utf-16-le")) // 2 <= 3500:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=None)
+    else:
+        # In-memory export: do not leave an additional historical file on the server.
+        with BytesIO(text.encode("utf-8-sig")) as document:
+            await bot.send_document(chat_id=chat_id, document=document,
+                                    filename="AI室使用记录.txt",
+                                    caption="AI室使用记录较长，已生成TXT文件。")
+
+
+async def cmd_ai_usage(update, context):
+    cid = chat_id_str(update)
+    cfg = get_cfg(cid)
+    remember_chat(cid)
+    await send_ai_usage(context.bot, cid, update.effective_chat.id, cfg)
+
+
 def report_text(cid,cfg):
     now=datetime.now(TZ_CHINA); bdate=business_date(now); summary={}; last={}
     for r in read_rows(cid)[1:]:
@@ -221,7 +300,7 @@ def config_text(cid,cfg):
     for name,data in cfg.get("group_count_limits",{}).items(): gl.append(f"{name}：{' + '.join(data['items'])} 合计 {data['limit']} 次")
     return f"⚙️ <b>本群配置</b>\n\n上班：{cfg['start']}\n下班：{cfg['end']}\n日报：{cfg['report']}\n清空：{cfg['reset']}\nAI室：{'、'.join(cfg['rooms'])}\n\n项目：{'、'.join(cfg['items'].keys())}\n\n超时限制：{cfg.get('timeout_limits',{})}\n单项次数限制：{cfg.get('count_limits',{})}\n合计次数限制：{('；'.join(gl) if gl else '无')}"
 
-def menu_text(): return "📋 <b>企业版 V5.1 菜单</b>\n\n普通文字：AI / AI室 / 排队 / 取消排队 / 报表 / 配置\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
+def menu_text(): return "📋 <b>企业版 V5.1 菜单</b>\n\n普通文字：AI / AI室 / AI室记录 / 排队 / 取消排队 / 报表 / 配置\n查询AI室记录：/airecords\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
 
 async def timeout_alert(context):
     d=context.job.data
@@ -301,6 +380,7 @@ async def handle_message(update, context):
     if text=="配置": return await update.message.reply_text(config_text(cid,cfg),parse_mode="HTML")
     if text=="报表": return await send_report(context.bot,cid,update.effective_chat.id,cfg,"出勤报表")
     if text=="AI室": return await update.message.reply_text(ai_status(cid,cfg),parse_mode="HTML")
+    if text=="AI室记录": return await send_ai_usage(context.bot,cid,update.effective_chat.id,cfg)
     if text=="排队": return await update.message.reply_text(queue_text(cid),parse_mode="HTML")
     if text=="取消排队": return await update.message.reply_text("✅ 已退出AI排队队列。" if remove_queue(cid,user.id) else "ℹ️ 你当前不在AI排队队列中。")
     if text=="AI":
@@ -338,7 +418,7 @@ async def handle_message(update, context):
             duration=f"{sec//60}分{sec%60}秒"; duration_msg=f"⏱️ 本次 [{la}] 共计离开：<b>{sec//60}</b> 分 <b>{sec%60}</b> 秒\n"
         else: duration_msg="ℹ️ 未找到离开记录。\n"
     past=today_count(cid,user.id,action,bdate)+1
-    append_row(cid,[now.strftime("%Y-%m-%d %H:%M:%S"),bdate,user.id,user.full_name,action,past,status,duration])
+    append_row(cid,[now.strftime("%Y-%m-%d %H:%M:%S"),bdate,user.id,user.full_name,action,past,status,duration,"AI室" if action in cfg["rooms"] else ""])
     if action in cfg.get("timeout_limits",{}):
         mins=int(cfg["timeout_limits"][action]); context.job_queue.run_once(timeout_alert,when=timedelta(minutes=mins),name=f"timeout_{cid}_{user.id}",data={"chat_id":update.effective_chat.id,"uid":user.id,"name":user.full_name,"action":action,"minutes":mins})
     reply=f"<b>{items.get(action,action)} 登记成功！</b>\n⏰ 时间：{now.strftime('%H:%M:%S')}\n🔢 今日该项累计：<b>{past}</b> 次\n"
@@ -365,6 +445,7 @@ async def handle_message(update, context):
 def main():
     if not TOKEN: print("❌ 没有读取到 TOKEN 环境变量"); return
     app=Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("airecords",cmd_ai_usage))
     app.add_handler(CommandHandler("chatid",cmd_chatid)); app.add_handler(CommandHandler("config",cmd_config)); app.add_handler(CommandHandler("menu",cmd_menu)); app.add_handler(CommandHandler("report",cmd_report)); app.add_handler(CommandHandler("testreport",cmd_report))
     app.add_handler(CommandHandler("setstart",lambda u,c:set_time_cmd(u,c,"start","setstart"))); app.add_handler(CommandHandler("setend",lambda u,c:set_time_cmd(u,c,"end","setend"))); app.add_handler(CommandHandler("setreport",lambda u,c:set_time_cmd(u,c,"report","setreport"))); app.add_handler(CommandHandler("setreset",lambda u,c:set_time_cmd(u,c,"reset","setreset")))
     app.add_handler(CommandHandler("setrooms",cmd_setrooms)); app.add_handler(CommandHandler("addroom",cmd_addroom)); app.add_handler(CommandHandler("delroom",cmd_delroom)); app.add_handler(CommandHandler("additem",cmd_additem)); app.add_handler(CommandHandler("delitem",cmd_delitem)); app.add_handler(CommandHandler("settimeout",cmd_settimeout)); app.add_handler(CommandHandler("limit",cmd_limit)); app.add_handler(CommandHandler("limitgroup",cmd_limitgroup))
