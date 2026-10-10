@@ -5,6 +5,8 @@ import threading
 from io import BytesIO
 from datetime import datetime, time, timedelta, timezone
 
+from hourly_groups import HourlyGroups
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -12,6 +14,7 @@ TOKEN = os.getenv("TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+HOURLY = HourlyGroups(os.path.join(DATA_DIR, "hourly_groups.sqlite3"))
 GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
 KNOWN_CHATS_FILE = os.path.join(DATA_DIR, "known_chats.json")
 TZ_CHINA = timezone(timedelta(hours=8))
@@ -300,7 +303,7 @@ def config_text(cid,cfg):
     for name,data in cfg.get("group_count_limits",{}).items(): gl.append(f"{name}：{' + '.join(data['items'])} 合计 {data['limit']} 次")
     return f"⚙️ <b>本群配置</b>\n\n上班：{cfg['start']}\n下班：{cfg['end']}\n日报：{cfg['report']}\n清空：{cfg['reset']}\nAI室：{'、'.join(cfg['rooms'])}\n\n项目：{'、'.join(cfg['items'].keys())}\n\n超时限制：{cfg.get('timeout_limits',{})}\n单项次数限制：{cfg.get('count_limits',{})}\n合计次数限制：{('；'.join(gl) if gl else '无')}"
 
-def menu_text(): return "📋 <b>企业版 V5.1 菜单</b>\n\n普通文字：AI / AI室 / AI室记录 / 排队 / 取消排队 / 报表 / 配置\n查询AI室记录：/airecords\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
+def menu_text(): return "📋 <b>企业版 V5.1 菜单</b>\n\n普通文字：AI / AI室 / AI室记录 / 排队 / 取消排队 / 报表 / 配置\n查询AI室记录：/airecords\n小组统计：/initgroups /groups /setgroup /delmember /hourlyreport\n\n时间：/setstart 09:55 /setend 02:00 /setreport 03:00 /setreset 05:05\nAI室：/setrooms 5 /addroom 6号AI室 /delroom 5号AI室\n项目：/additem 培训 📚 进入培训 /delitem 培训\n限制：/settimeout 吃饭 30 /limit wc大 3 /limitgroup 离岗 5 wc小 wc大 抽烟"
 
 async def timeout_alert(context):
     d=context.job.data
@@ -418,6 +421,7 @@ async def handle_message(update, context):
             duration=f"{sec//60}分{sec%60}秒"; duration_msg=f"⏱️ 本次 [{la}] 共计离开：<b>{sec//60}</b> 分 <b>{sec%60}</b> 秒\n"
         else: duration_msg="ℹ️ 未找到离开记录。\n"
     past=today_count(cid,user.id,action,bdate)+1
+    HOURLY.record(cid, update.message.message_id, now, str(user.id), user.full_name, action)
     append_row(cid,[now.strftime("%Y-%m-%d %H:%M:%S"),bdate,user.id,user.full_name,action,past,status,duration,"AI室" if action in cfg["rooms"] else ""])
     if action in cfg.get("timeout_limits",{}):
         mins=int(cfg["timeout_limits"][action]); context.job_queue.run_once(timeout_alert,when=timedelta(minutes=mins),name=f"timeout_{cid}_{user.id}",data={"chat_id":update.effective_chat.id,"uid":user.id,"name":user.full_name,"action":action,"minutes":mins})
@@ -445,13 +449,19 @@ async def handle_message(update, context):
 def main():
     if not TOKEN: print("❌ 没有读取到 TOKEN 环境变量"); return
     app=Application.builder().token(TOKEN).build()
+    for command in ["initgroups", "setgroup", "delmember", "groups", "hourlyreport"]:
+        app.add_handler(CommandHandler(command, HOURLY.command))
     app.add_handler(CommandHandler("airecords",cmd_ai_usage))
     app.add_handler(CommandHandler("chatid",cmd_chatid)); app.add_handler(CommandHandler("config",cmd_config)); app.add_handler(CommandHandler("menu",cmd_menu)); app.add_handler(CommandHandler("report",cmd_report)); app.add_handler(CommandHandler("testreport",cmd_report))
     app.add_handler(CommandHandler("setstart",lambda u,c:set_time_cmd(u,c,"start","setstart"))); app.add_handler(CommandHandler("setend",lambda u,c:set_time_cmd(u,c,"end","setend"))); app.add_handler(CommandHandler("setreport",lambda u,c:set_time_cmd(u,c,"report","setreport"))); app.add_handler(CommandHandler("setreset",lambda u,c:set_time_cmd(u,c,"reset","setreset")))
     app.add_handler(CommandHandler("setrooms",cmd_setrooms)); app.add_handler(CommandHandler("addroom",cmd_addroom)); app.add_handler(CommandHandler("delroom",cmd_delroom)); app.add_handler(CommandHandler("additem",cmd_additem)); app.add_handler(CommandHandler("delitem",cmd_delitem)); app.add_handler(CommandHandler("settimeout",cmd_settimeout)); app.add_handler(CommandHandler("limit",cmd_limit)); app.add_handler(CommandHandler("limitgroup",cmd_limitgroup))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if app.job_queue is None: print('❌ JobQueue 未启用'); return
+    async def hourly_tick(context):
+        await HOURLY.tick(context.bot, get_cfg=get_cfg)
+    app.job_queue.run_repeating(hourly_tick, interval=30, first=5, name="hourly_groups")
     app.job_queue.run_repeating(scheduler, interval=60, first=10, name="v5_scheduler")
     print("✅ 企业版 V5.1 已启动：详细离岗统计 / 多群独立 / AI排队 / TXT日报", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__ == "__main__": main()
+
