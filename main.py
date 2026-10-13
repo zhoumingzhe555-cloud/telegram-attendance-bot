@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 TOKEN = os.getenv("TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.getenv("DATA_DIR") or os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 HOURLY = HourlyGroups(os.path.join(DATA_DIR, "hourly_groups.sqlite3"))
 GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
