@@ -1,6 +1,8 @@
 import csv
 import json
 import os
+import re
+from html import escape
 import threading
 from io import BytesIO
 from datetime import datetime, time, timedelta, timezone
@@ -12,7 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 TOKEN = os.getenv("TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.getenv("DATA_DIR") or os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 HOURLY = HourlyGroups(os.path.join(DATA_DIR, "hourly_groups.sqlite3"))
 GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
@@ -61,7 +63,7 @@ def ensure_csv(cid):
     p = records_file(cid)
     if not os.path.exists(p):
         with open(p, "w", newline="", encoding="utf-8-sig") as f:
-            csv.writer(f).writerow(["时间","日期","用户ID","昵称","动作项目","当前项目累计次数","考勤状态","离开时长","记录类型"])
+            csv.writer(f).writerow(["时间","日期","用户ID","昵称","动作项目","当前项目累计次数","考勤状态","离开时长","记录类型","通话开始类型","消息ID"])
 
 def get_cfg(cid):
     groups = load_json(GROUPS_FILE, {})
@@ -110,6 +112,54 @@ def normalize(raw, cfg):
 def read_rows(cid):
     ensure_csv(cid)
     with open(records_file(cid), "r", encoding="utf-8-sig") as f: return list(csv.reader(f))
+
+def call_start(raw, cfg):
+    """Only the first line's explicit start declaration counts, never its notes."""
+    first = raw.strip().splitlines()[0] if raw.strip() else ""
+    for old, new in TRAD_MAP.items():
+        first = first.replace(old, new)
+    first = re.sub(r"\s+", "", first)
+    first = re.sub(r"^(?:报备|報備)[:：]?", "", first)
+    for room in sorted(cfg["rooms"], key=len, reverse=True):
+        if first.lower().startswith(room.lower()):
+            first = first[len(room):].lstrip(":：-，,")
+            break
+    match = re.match(r"^(语音|视频)", first)
+    if not match:
+        return None
+    tail = first[match.end():].lstrip(":：，,。.!！-—")
+    if re.match(r"^(?:结束|結束|已结束|已結束|完成|已完成|取消|结束了|結束了|用时|用時|时长|時長|次数|次數|统计|統計|报表|報表|记录|記錄)", tail):
+        return None
+    return match.group(1)
+
+def call_totals(cid, bdate):
+    totals = {}
+    for row in read_rows(cid)[1:]:
+        if len(row) < 10 or row[1] != bdate or row[9] not in ("语音", "视频"):
+            continue
+        stat = totals.setdefault(str(row[2]), {"语音": 0, "视频": 0})
+        stat[row[9]] += 1
+    return totals
+
+def call_report_text(cid):
+    bdate = business_date(datetime.now(TZ_CHINA))
+    totals = call_totals(cid, bdate)
+    names = {str(r[2]): r[3] for r in read_rows(cid)[1:] if len(r) >= 5 and r[1] == bdate}
+    for _, name, uid in HOURLY.members(cid):
+        if uid:
+            names.setdefault(str(uid), name)
+    lines = [f"【语音／视频次数统计】（{bdate}）", "按开始报备计数，结束消息不计次。", ""]
+    for uid, name in names.items():
+        stat = totals.get(uid, {"语音": 0, "视频": 0})
+        lines.append(f"{name}（ID:{uid}）：语音{stat['语音']}次，视频{stat['视频']}次")
+    if not names:
+        lines.append("暂无人员记录。")
+    lines.append(f"全群合计：语音{sum(s['语音'] for s in totals.values())}次，视频{sum(s['视频'] for s in totals.values())}次")
+    return "\n".join(lines)
+
+async def cmd_calls(update, context):
+    cid = chat_id_str(update)
+    await HOURLY.send(context.bot, cid, call_report_text(cid))
 
 def append_row(cid, row):
     ensure_csv(cid)
@@ -263,6 +313,7 @@ async def cmd_ai_usage(update, context):
 
 def report_text(cid,cfg):
     now=datetime.now(TZ_CHINA); bdate=business_date(now); summary={}; last={}
+    calls = call_totals(cid, bdate)
     for r in read_rows(cid)[1:]:
         if len(r)<8 or r[1]!=bdate: continue
         uid,name,act,status,dur=r[2],r[3],r[4],r[6],r[7]
@@ -281,7 +332,8 @@ def report_text(cid,cfg):
     if not summary: return f"📋 全员出勤总榜单 ({bdate})\n━━━━━━━━━━━━━━━━━━\n\nℹ️ 暂无任何打卡数据。"
     text=f"📋 全员出勤总榜单 ({bdate})\n━━━━━━━━━━━━━━━━━━\n\n"
     for uid,d in summary.items():
-        text+=f"👤 人员：{d['name']}\n ├ ⏳ 上班状态： {d['上班']}\n ├ 🌙 下班状态： {d['下班']}\n"
+        stat = calls.get(str(uid), {"语音": 0, "视频": 0})
+        text+=f"👤 人员：{escape(d['name'])}\n ├ ⏳ 上班状态： {d['上班']}\n ├ 🌙 下班状态： {d['下班']}\n ├ 📞 开始报备：语音{stat['语音']}次、视频{stat['视频']}次\n"
         details=[]
         for act,info in d["actions"].items():
             icon=cfg["items"].get(act,"📊").split(" ")[0]
@@ -379,6 +431,19 @@ async def handle_message(update, context):
     if not update.message or not update.message.text or not update.effective_user: return
     cid=chat_id_str(update); cfg=get_cfg(cid); remember_chat(cid); user=update.effective_user
     raw=update.message.text.strip(); text=normalize(raw,cfg); print("收到消息:",cid,raw,flush=True)
+    if text in ["语音统计", "語音統計", "视频统计", "視頻統計", "通话统计", "通話統計"]:
+        return await cmd_calls(update, context)
+    call = call_start(raw, cfg)
+    first = normalize(raw.splitlines()[0], cfg).replace(" ", "").replace("　", "")
+    if call:
+        declaration = re.sub(r"^(?:报备|報備)[:：]?", "", first)
+        room = next((r for r in sorted(cfg['rooms'], key=len, reverse=True) if declaration.lower().startswith(r.lower())), None)
+        text = room or call
+    elif first.startswith(("语音", "视频")) or re.match(r"^(?:报备|報備)[:：]?(?:语音|视频)", first):
+        # Completion summaries must not become new leave/call registrations.
+        return
+    elif any(first.lower().startswith(r.lower()) and re.match(r"^[:：，,-]*(语音|视频)", first[len(r):]) for r in cfg['rooms']):
+        return
     if text=="菜单": return await update.message.reply_text(menu_text(),parse_mode="HTML")
     if text=="配置": return await update.message.reply_text(config_text(cid,cfg),parse_mode="HTML")
     if text=="报表": return await send_report(context.bot,cid,update.effective_chat.id,cfg,"出勤报表")
@@ -397,6 +462,8 @@ async def handle_message(update, context):
     for key in items:
         if text.lower().startswith(key.lower()): action=key; break
     if not action: return
+    if any(len(r) > 10 and r[10] == str(update.message.message_id) for r in read_rows(cid)[1:]):
+        return
     if action in cfg["rooms"]:
         active=active_rooms(cid,cfg)
         if action in active and active[action]["uid"]!=str(user.id):
@@ -422,11 +489,14 @@ async def handle_message(update, context):
         else: duration_msg="ℹ️ 未找到离开记录。\n"
     past=today_count(cid,user.id,action,bdate)+1
     HOURLY.record(cid, update.message.message_id, now, str(user.id), user.full_name, action)
-    append_row(cid,[now.strftime("%Y-%m-%d %H:%M:%S"),bdate,user.id,user.full_name,action,past,status,duration,"AI室" if action in cfg["rooms"] else ""])
+    append_row(cid,[now.strftime("%Y-%m-%d %H:%M:%S"),bdate,user.id,user.full_name,action,past,status,duration,"AI室" if action in cfg["rooms"] else "",call or "",update.message.message_id])
     if action in cfg.get("timeout_limits",{}):
         mins=int(cfg["timeout_limits"][action]); context.job_queue.run_once(timeout_alert,when=timedelta(minutes=mins),name=f"timeout_{cid}_{user.id}",data={"chat_id":update.effective_chat.id,"uid":user.id,"name":user.full_name,"action":action,"minutes":mins})
     reply=f"<b>{items.get(action,action)} 登记成功！</b>\n⏰ 时间：{now.strftime('%H:%M:%S')}\n🔢 今日该项累计：<b>{past}</b> 次\n"
     if duration_msg: reply+=duration_msg
+    if call:
+        counts = call_totals(cid, bdate).get(str(user.id), {"语音": 0, "视频": 0})
+        reply += f"📞 今日开始报备：语音 <b>{counts['语音']}</b> 次，视频 <b>{counts['视频']}</b> 次\n"
     if action in cfg.get("count_limits",{}) and past>int(cfg["count_limits"][action]): reply+=f"🚨 <b>次数警告：</b>{action} 今日第 <b>{past}</b> 次，超过规定 <b>{cfg['count_limits'][action]}</b> 次！\n"
     for lname,data in cfg.get("group_count_limits",{}).items():
         limit_items = data.get("items", [])
@@ -452,6 +522,7 @@ def main():
     for command in ["initgroups", "setgroup", "delmember", "groups", "hourlyreport"]:
         app.add_handler(CommandHandler(command, HOURLY.command))
     app.add_handler(CommandHandler("airecords",cmd_ai_usage))
+    app.add_handler(CommandHandler("calls",cmd_calls))
     app.add_handler(CommandHandler("chatid",cmd_chatid)); app.add_handler(CommandHandler("config",cmd_config)); app.add_handler(CommandHandler("menu",cmd_menu)); app.add_handler(CommandHandler("report",cmd_report)); app.add_handler(CommandHandler("testreport",cmd_report))
     app.add_handler(CommandHandler("setstart",lambda u,c:set_time_cmd(u,c,"start","setstart"))); app.add_handler(CommandHandler("setend",lambda u,c:set_time_cmd(u,c,"end","setend"))); app.add_handler(CommandHandler("setreport",lambda u,c:set_time_cmd(u,c,"report","setreport"))); app.add_handler(CommandHandler("setreset",lambda u,c:set_time_cmd(u,c,"reset","setreset")))
     app.add_handler(CommandHandler("setrooms",cmd_setrooms)); app.add_handler(CommandHandler("addroom",cmd_addroom)); app.add_handler(CommandHandler("delroom",cmd_delroom)); app.add_handler(CommandHandler("additem",cmd_additem)); app.add_handler(CommandHandler("delitem",cmd_delitem)); app.add_handler(CommandHandler("settimeout",cmd_settimeout)); app.add_handler(CommandHandler("limit",cmd_limit)); app.add_handler(CommandHandler("limitgroup",cmd_limitgroup))
@@ -464,4 +535,5 @@ def main():
     print("✅ 企业版 V5.1 已启动：详细离岗统计 / 多群独立 / AI排队 / TXT日报", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__ == "__main__": main()
+
 
